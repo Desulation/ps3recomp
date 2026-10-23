@@ -714,6 +714,7 @@ static void* spu_exec_thread_proc(void* arg)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
 #endif
     spu_thread_t* t = (spu_thread_t*)arg;
+    spu_fp_thread_spu_mode();
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;

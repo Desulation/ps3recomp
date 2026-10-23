@@ -67,6 +67,19 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
               if (!VirtualAlloc(p, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 0;
           } else if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
               return 0;
+          } else {
+              /* VirtualQuery sizes the region by walking it, and the guest
+               * arena's committed run is ~1.9 GB: one call costs 6-9 ms.
+               * Cache every 64K page the answer covers, not just this one, so
+               * the walk is paid once per region instead of once per page --
+               * Warhawk's job outputs touch fresh pages throughout a map load,
+               * and its SPU job batches missed their 100 ms deadline queueing
+               * behind these calls. */
+              uintptr_t r0 = (uintptr_t)mbi.BaseAddress - (uintptr_t)vm_base;
+              uintptr_t r1 = r0 + mbi.RegionSize;
+              if (r1 > 0x100000000ull) r1 = 0x100000000ull;
+              for (uintptr_t q = (r0 + 0xFFFF) >> 16; q < (r1 >> 16); q++)
+                  g_vm_page_bitmap[q >> 3] |= (uint8_t)(1u << (q & 7));
           }
           g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
       }
@@ -1569,7 +1582,12 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
         spu->mfc_eal = value;
         break;
     case MFC_Size:
-        spu->mfc_size = value;
+        /* A 16-bit channel: the MFC ignores the upper bits of the word.
+         * Warhawk's gameplay job at EBOOT 0x10058D00 computes its PUT size as
+         * (word + 16) & ~15 from a descriptor word whose bit 31 is a flag, and
+         * writes 0x80000010; kept whole, mfc_do_transfer rejected that 16-byte
+         * PUT as malformed and the map load stalled. */
+        spu->mfc_size = value & 0xFFFF;
         break;
     case MFC_TagID:
         spu->mfc_tag = value & 0x1F;

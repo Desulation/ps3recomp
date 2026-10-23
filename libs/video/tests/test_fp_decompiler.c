@@ -520,6 +520,40 @@ int main(void)
         check_absent("persp_off_no_helper", hlsl, "_rsx_inv_w");
     }
 
+    /* Source precision modifiers (SRC1 bits 19-27, three per operand; RPCS3
+     * GetSRC): saturate clamps before abs, fx12/fx9 after it, negate last,
+     * and all flush NaN to 0. Warhawk's characters take LG2 of a saturated
+     * N.L interpolant; read raw, a negative N.L made NaN and lit them black. */
+    {
+        u8 prog[16];
+        const u32 swz_z = (2u<<9)|(2u<<11)|(2u<<13)|(2u<<15);
+        put_word(prog + 0, OPC(0x1D) | OUTMASK_ALL | INSRC(0xA) | END); /* LG2 r0, TC6.z */
+        put_word(prog + 4, T_INPUT | swz_z | EXEC_ALWAYS);
+        put_word(prog + 8, 4u << 19);                                   /* src0: saturate */
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("prec_sat_lg2", hlsl, "log2((_rsx_pclamp((input.tc6).zzzz, 0.0, 1.0)).x)");
+        check("prec_helper", hlsl, "float4 _rsx_pclamp(float4 x, float lo, float hi)");
+
+        /* MAD r0, -|r1|(fx12), r2, -r3(fx9): order and per-operand fields. */
+        put_word(prog + 0, OPC(0x04) | OUTMASK_ALL | END);
+        put_word(prog + 4, T_TEMP | REG(1) | SWZ_IDENT | (1u<<17) | (1u<<29) | EXEC_ALWAYS);
+        put_word(prog + 8, T_TEMP | REG(2) | SWZ_IDENT | (2u << 19) | (3u << 25));
+        put_word(prog + 12, T_TEMP | REG(3) | SWZ_IDENT | (1u<<17));
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("prec_fx12_after_abs", hlsl, "-(_rsx_pclamp(abs((r[1]).xyzw), -2.0, 2.0))");
+        check("prec_fx9_src2", hlsl, "-(_rsx_pclamp((r[3]).xyzw, -1.0, 1.0))");
+        check("prec_src1_plain", hlsl, "((r[2]).xyzw)");
+
+        /* COL0 is saturated already: no second clamp, no helper. */
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 4u << 19);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("prec_col0_unclamped", hlsl, "_rsx_pclamp");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

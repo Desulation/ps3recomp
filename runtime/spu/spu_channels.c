@@ -293,7 +293,27 @@ typedef struct spu_mfc_slot {
 static spu_mfc_slot* s_mfc_slots;
 static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
 
+/* mfc_for runs on every MFC channel read and write (each DMA's six setup
+ * writes, every tag-status poll). Taking the claim lock and walking the slot
+ * list each time had six SPURS workers bouncing one lock line between cores.
+ * Each thread remembers the last context it asked about; freeing any engine
+ * bumps s_mfc_gen, which retires every thread's memory of it (a later context
+ * at the same address must not find the freed engine). */
+static volatile LONG s_mfc_gen;
+static SPU_THREAD_LOCAL spu_context* t_mfc_ctx;
+static SPU_THREAD_LOCAL mfc_engine* t_mfc_eng;
+static SPU_THREAD_LOCAL LONG t_mfc_gen;
+static mfc_engine* mfc_lookup(spu_context* ctx);
 static mfc_engine* mfc_for(spu_context* ctx)
+{
+    const LONG gen = s_mfc_gen;
+    if (t_mfc_ctx == ctx && t_mfc_gen == gen && ctx) return t_mfc_eng;
+    mfc_engine* m = mfc_lookup(ctx);
+    t_mfc_ctx = ctx; t_mfc_eng = m; t_mfc_gen = gen;
+    return m;
+}
+
+static mfc_engine* mfc_lookup(spu_context* ctx)
 {
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
@@ -338,6 +358,7 @@ void spu_mfc_release(spu_context* ctx)
         free(slot);
         break;
     }
+    InterlockedIncrement(&s_mfc_gen);
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
 }
 
@@ -356,6 +377,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
             link = &slot->next;
         }
     }
+    InterlockedIncrement(&s_mfc_gen);
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
 }
 
@@ -1487,6 +1509,16 @@ int spu_have_function(uint32_t addr)
  * spu_fn_registry.c before the registry was consolidated into this TU. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    /* A resident code region owns its LS range, exactly as in
+     * spu_indirect_branch: resolve there (and only there) first. Looking up
+     * only ctx->image_id meant the interpreter could never rejoin a streamed
+     * module's lift -- once any path into Warhawk's NextSynth job fell back to
+     * the interpreter, the rest of the job stayed interpreted. */
+    if (ctx)
+        for (unsigned slot = 0; slot < 4; ++slot)
+            if (ctx->resident_code[slot].image_id && lsa >= ctx->resident_code[slot].lsa &&
+                lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
+                return (spu_lifted_fn)spu_lookup(lsa, ctx->resident_code[slot].image_id);
     return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
 }
 
@@ -1528,6 +1560,8 @@ static struct { uint32_t entry; int image_id; } s_stack_reset[16];
 static unsigned s_stack_reset_count;
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
+    extern int g_spu_step_full;
+    g_spu_step_full = 1;            /* every step checks the entries (spu_step_hooks) */
     if (s_stack_reset_count < 16) {
         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
         s_stack_reset[s_stack_reset_count++].image_id = image_id;
@@ -2129,10 +2163,15 @@ void spu_indirect_branch(spu_context* ctx)
         if (ctx->pc == SPURS_PM_SELECT_WORKLOAD_LS) {
             /* cellSpursModulePoll: report "no contention — keep running".
              * (The host scheduler admits bounded workers; this service does not preempt.) */
-            unsigned n = ++g_spurs_pm_polls;
-            if (n <= 4 || (n % 4096) == 0)
-                fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
-                        n, ctx->gpr[3]._u32[0]);
+            /* g_spurs_pm_polls counts this run's polls and is reset every
+             * policy run, so it cannot gate the print: gated on it, the line
+             * printed on every run (15-25% of SPU worker time in WriteFile in
+             * Warhawk's match). Gate on a per-thread lifetime count. */
+            ++g_spurs_pm_polls;
+            { static SPU_THREAD_LOCAL unsigned long _n = 0; unsigned long n = ++_n;
+              if (n <= 4 || (n % 4096) == 0)
+                  fprintf(stderr, "[spurs-pm] poll #%lu (r3=0x%08X) -> continue\n",
+                          n, ctx->gpr[3]._u32[0]); }
             ctx->gpr[3] = spu_make_preferred_u32(0);
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;

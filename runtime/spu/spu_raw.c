@@ -234,6 +234,7 @@ static DWORD WINAPI raw_spu_thread(LPVOID arg)
 {
     raw_spu* s = (raw_spu*)arg;
     spu_context* c = s->ctx;
+    spu_fp_thread_spu_mode();
 
     c->status = SPU_STATUS_RUNNING;
     publish(s);

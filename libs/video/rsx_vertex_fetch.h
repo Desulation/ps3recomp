@@ -68,6 +68,30 @@ float rsx_rd_half_be(const u8* p);  /* 2-byte IEEE half -> float  */
  */
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4]);
 
+/* The same fetch for a whole vertex, with the per-draw work done once.
+ *
+ * rsx_fetch_attrib decides everything per call: whether the slot has an
+ * array, its type, its frequency rule and how its offset resolves. A draw of
+ * thousands of vertices asked those questions 16 times per vertex, and the
+ * vertex fetch was a third of a Warhawk frame. A plan answers them once per
+ * draw (the state cannot change inside one) and lists only the slots that
+ * have arrays; rsx_fetch_vertex then starts from the constant registers and
+ * converts just those. The result is identical to calling rsx_fetch_attrib on
+ * all 16 slots (tests/test_vertex_fetch_cmp.c compares them). */
+typedef struct {
+    u8  idx, type, n, main;   /* slot, NV4097 type, components 1..4, MAIN (IO) array */
+    u32 stride, freq;         /* freq: divisor, 0 = per vertex */
+    int modulo;               /* freq applies as vi % freq (else vi / freq) */
+    u32 off;                  /* MAIN: IO offset; LOCAL: resolved guest address */
+} rsx_fetch_plan_attr;
+typedef struct {
+    float defaults[16][4];    /* NV4097_SET_VERTEX_DATA4F_M for every slot */
+    int n;
+    rsx_fetch_plan_attr a[16];
+} rsx_fetch_plan;
+void rsx_fetch_plan_init(const rsx_state* st, rsx_fetch_plan* plan);
+void rsx_fetch_vertex(const rsx_fetch_plan* plan, u32 vi, float out[16][4]);
+
 #ifdef __cplusplus
 }
 #endif

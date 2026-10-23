@@ -20,6 +20,7 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+#include "ps3emu/ps3_env.h"             /* getenv cached per call site */
 
 /* ---------------------------------------------------------------------------
  * Global backend
@@ -72,6 +73,11 @@ void rsx_state_init(rsx_state* state)
     /* Default cull */
     state->cull_face = 1; /* BACK */
     state->front_face = 0; /* CW */
+    state->zminmax_control = 1; /* near/far clipping on */
+    /* NV40 reset ZSTENCIL_CLEAR_VALUE (Z24S8: depth24 << 8 | stencil8):
+     * depth 1.0, stencil 0, as rsx_dispatch.c seeds it. Warhawk never writes
+     * the register and clears depth with this default. */
+    state->zstencil_clear_value = 0xFFFFFF00u;
 
     /* Default color mask: all channels writable (A|R|G|B) */
     state->color_mask = 0x01010101;
@@ -559,6 +565,18 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
     if (method == NV4097_SET_FRONT_FACE) {
         state->front_face = data;
+        return 0;
+    }
+    if (method == NV4097_SET_ZMIN_MAX_CONTROL) {
+        state->zminmax_control = data;
+        return 0;
+    }
+    if (method == NV4097_SET_RESTART_INDEX_ENABLE) {
+        state->restart_index_enable = (data != 0);
+        return 0;
+    }
+    if (method == NV4097_SET_RESTART_INDEX) {
+        state->restart_index = data;
         return 0;
     }
 

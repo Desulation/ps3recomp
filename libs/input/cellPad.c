@@ -47,11 +47,16 @@ static double pad_clock(unsigned long long t0_ms)
   #define PAD_BACKEND_XINPUT 0
 #endif
 
-#if PAD_BACKEND_XINPUT
+/* windows.h for every Windows build, not just XInput: pad_now_ms and the
+ * keyboard fallback use it whichever backend reads the controllers. */
+#ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
     #define WIN32_LEAN_AND_MEAN
   #endif
   #include <windows.h>
+#endif
+
+#if PAD_BACKEND_XINPUT
   #include <xinput.h>
   #pragma comment(lib, "xinput.lib")
 #endif
@@ -159,14 +164,17 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
     return (u8)val;
 }
 
+#endif /* PAD_BACKEND_XINPUT */
+
 /* Keyboard fallback for port 0.
  *
- * The only backend here is XInput, so on a machine with no controller plugged
- * in a title gets a pad that is reported present and never presses anything --
- * it can be watched but not played. That is what The Simpsons Arcade Game hit:
- * it reached its attract loop and no input existed to start a game.
+ * On a machine with no controller plugged in a title gets a pad that is
+ * reported present and never presses anything -- it can be watched but not
+ * played. That is what The Simpsons Arcade Game hit: it reached its attract
+ * loop and no input existed to start a game. Lives outside the XInput block so
+ * a Windows build on the SDL2 backend (PS3RECOMP_PAD_USE_SDL2) keeps it too.
  *
- * Only fills in for port 0, only when XInput found nothing there, so a real
+ * Only fills in for port 0, only when the backend found nothing there, so a real
  * controller always wins and nothing changes for a port that has one. Keys are
  * read only while a window of THIS process is in the foreground, so typing in
  * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
@@ -228,10 +236,12 @@ static void pad_poll_keyboard(void)
 
     { static int said = 0;
       if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
+          printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
           fflush(stdout); } }
 }
 #endif
+
+#if PAD_BACKEND_XINPUT
 
 static void pad_poll_xinput(void)
 {
@@ -733,7 +743,13 @@ skip_inject: ;
      *   echo 0x4000 > pad.txt    # CROSS
      *   echo 0x0040 4 > pad.txt  # DOWN for 4 polls (menus auto-repeat a
      *                            # long hold; the default is 40)
-     */
+     *   echo S 128 0 190 128 > pad.txt  # hold the sticks (lx ly rx ry,
+     *                            # 0-255) until the next S line
+     *
+     * The S form lets a driver start moving when it sees the player spawn;
+     * PAD_STICK's hold windows count from boot, and the time from boot to
+     * a spawn changes from run to run. "S 128 128 128 128" centres them. */
+    static int s_pf_stick_on = 0; static unsigned char s_pf_stick[4];
     { static int s_pf = -1; static char pf_path[512];
       static unsigned held_mask = 0; static int held_n = 0;
       if (s_pf < 0) { const char* e = getenv("PAD_FILE");
@@ -744,7 +760,16 @@ skip_inject: ;
               FILE* f = fopen(pf_path, "rb");
               if (f) {
                   char buf[64]; buf[0] = 0;
-                  if (fgets(buf, sizeof buf, f)) {
+                  int stick_line = 0;
+                  if (fgets(buf, sizeof buf, f) && buf[0] == 'S') {
+                      int v[4] = {128, 128, 128, 128};
+                      if (sscanf(buf + 1, "%d %d %d %d", &v[0], &v[1], &v[2], &v[3]) == 4) {
+                          for (int k = 0; k < 4; k++) s_pf_stick[k] = (unsigned char)v[k];
+                          s_pf_stick_on = !(v[0] == 128 && v[1] == 128 && v[2] == 128 && v[3] == 128);
+                          fprintf(stderr, "[cellPad] PAD_FILE sticks %d %d %d %d%c", v[0], v[1], v[2], v[3], 10);
+                      }
+                      stick_line = 1;
+                  } else if (buf[0]) {
                       char* rest;
                       unsigned m = (unsigned)strtoul(buf, &rest, 0);
                       int n = (int)strtol(rest, 0, 0);
@@ -752,7 +777,7 @@ skip_inject: ;
                                printf("[cellPad] PAD_FILE press 0x%04X\n", m); fflush(stdout); }
                   }
                   fclose(f);
-                  if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
+                  if (held_n > 0 || stick_line) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
               }
           }
           if (held_n > 0) { held_n--;
@@ -767,20 +792,41 @@ skip_inject: ;
      * started -- which can leave the subject of the demo off-screen or too far
      * away to make out. Legit input simulation, same footing as YDKJ_INJECT_PAD. */
     { static int s_st = -1;
-      static unsigned char s_v[4] = {128,128,128,128};
       /* Optional 5th/6th fields: the seconds the hold starts and ends, so the menus
-       * before gameplay are not driven by it (PAD_STICK="128,0,128,128,300,320"). */
-      static double s_from = 0, s_until = 1e30; static unsigned long long s_t0 = 0;
+       * before gameplay are not driven by it (PAD_STICK="128,0,128,128,300,320").
+       * Several holds are separated by ';' (walk somewhere, then turn). */
+      enum { PAD_STICK_HOLDS = 8 };
+      static unsigned char s_v[PAD_STICK_HOLDS][4];
+      static double s_from[PAD_STICK_HOLDS], s_until[PAD_STICK_HOLDS];
+      static int s_n = 0; static unsigned long long s_t0 = 0;
       if (!s_t0) s_t0 = GetTickCount64();
       if (s_st < 0) { const char* e = getenv("PAD_STICK");
         s_st = e ? 1 : 0;
-        if (e) { int a=128,b=128,c=128,d=128;
-                 sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
-                 s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
-                 s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
-      if (s_st && pad_clock(s_t0) >= s_from && pad_clock(s_t0) < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
-                  hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
+        while (e && *e && s_n < PAD_STICK_HOLDS) {
+            int a=128,b=128,c=128,d=128;
+            s_from[s_n] = 0; s_until[s_n] = 1e30;
+            sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from[s_n],&s_until[s_n]);
+            s_v[s_n][0]=(unsigned char)a; s_v[s_n][1]=(unsigned char)b;
+            s_v[s_n][2]=(unsigned char)c; s_v[s_n][3]=(unsigned char)d;
+            s_n++;
+            e = strchr(e, ';'); if (e) e++; } }
+      int hold = -1;
+      if (s_st) { double now = pad_clock(s_t0);
+          for (int i = 0; i < s_n; i++)
+              if (now >= s_from[i] && now < s_until[i]) { hold = i; break; } }
+      if (s_pf_stick_on) { hs->analog_lx = s_pf_stick[0]; hs->analog_ly = s_pf_stick[1];
+                  hs->analog_rx = s_pf_stick[2]; hs->analog_ry = s_pf_stick[3];
                   hs->connected = 1; }
+      if (hold >= 0) { hs->analog_lx = s_v[hold][0]; hs->analog_ly = s_v[hold][1];
+                  hs->analog_rx = s_v[hold][2]; hs->analog_ry = s_v[hold][3];
+                  hs->connected = 1; }
+      /* Mark each hold's start and end on stderr, so per-frame logs there (PERF)
+       * can be split into the windows with and without the sticks held. */
+      { static int s_was = -1;
+        if (hold != s_was) {
+            if (s_was >= 0) fprintf(stderr, "[cellPad] PAD_STICK hold off at %.1f s\n", pad_clock(s_t0));
+            if (hold >= 0)  fprintf(stderr, "[cellPad] PAD_STICK hold on at %.1f s\n", pad_clock(s_t0));
+            s_was = hold; } }
       /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
        * deflections instead of holding one. Guessing a single stick position and
        * re-running costs ~5 minutes a try; a sweep answers "can input move the

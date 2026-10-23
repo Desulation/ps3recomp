@@ -550,7 +550,17 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
                                         func_opd, 0);
     if (result < 0)
         return CELL_GAME_ERROR_PARAM;   /* callback reported an error */
-    /* OK / OK_CANCEL: succeed (our HLE doesn't create/modify the on-disk data). */
+    /* CBRESULT_OK means "go ahead": firmware creates /dev_hdd0/game/<dir>/USRDIR
+     * if it is missing, and titles that install to the HDD then cellFsOpen files
+     * there with O_CREAT. Without the directory every one of those opens fails
+     * on the host -- Warhawk's first-boot installer showed "Install Error".
+     * OK_CANCEL is check-only and leaves the disk alone. */
+    if (result == CELL_GAMEDATA_CBRESULT_OK) {
+        char usrdir[CELL_GAME_PATH_MAX];
+        snprintf(usrdir, sizeof usrdir, "%s/%s/USRDIR", content_root(),
+                 (const char*)(vm_base + dir_ea));
+        ensure_dirs(usrdir);
+    }
     return CELL_OK;
 }
 

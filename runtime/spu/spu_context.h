@@ -496,6 +496,12 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #endif
 SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      */
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
+/* One gate in front of every LS-access diagnostic: 1 until the first accesses
+ * have read the environment, then 1 only if SPU_LS_LOWREAD, SPU_LS_WATCH or
+ * SPU_SMC_WATCH is set. The accessors test it alone instead of each probe's own
+ * gate: with -fno-strict-aliasing every LS store forced all of those to be
+ * reloaded, a tenth of a skinning job's time. */
+SPU_GATE int g_spu_ls_diag = 1;
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
 SPU_GATE int g_wws_read_probe = 0;
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
@@ -536,15 +542,27 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
     }
 }
 
+static inline void spu_ls_diag_update(void)
+{
+    g_spu_ls_diag = g_spu_ls_probe != 0 || g_spu_ls_watch_n != 0 || g_spu_smc_watch != 0;
+}
+static __attribute__((noinline, cold)) void spu_ls_read_diag(const spu_context* ctx, uint32_t lsa)
+{
+    if (g_spu_ls_probe != 0 || (ctx->image_id == 2 && ctx->policy_mode))
+        spu_ls_read_probe(ctx, lsa);
+    lsa &= SPU_LS_MASK & ~0xFu;
+    spu_ls_watch_hit2(lsa, 0, &ctx->ls[lsa], (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    spu_ls_diag_update();
+}
+
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
-        spu_ls_read_probe(ctx, lsa);
+    if (__builtin_expect(g_spu_ls_diag != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
+        spu_ls_read_diag(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
-    spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
 #if SPU_LS_FAST
     uint32_t w0, w1, w2, w3;
     memcpy(&w0, p,      4); memcpy(&w1, p + 4,  4);
@@ -615,6 +633,15 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
       } }
 }
 
+static __attribute__((noinline, cold)) void spu_ls_write_diag(spu_context* ctx, uint32_t lsa, const uint8_t* p)
+{
+    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+    if (g_spu_smc_watch != 0)
+        spu_ls_write_probe_smc(ctx, lsa, p);
+    spu_ls_diag_update();
+}
+
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
@@ -641,10 +668,8 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
-    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-    if (__builtin_expect(g_spu_smc_watch != 0, 0))
-        spu_ls_write_probe_smc(ctx, lsa, p);
+    if (__builtin_expect(g_spu_ls_diag != 0, 0))
+        spu_ls_write_diag(ctx, lsa, p);
 }
 
 /* ---------------------------------------------------------------------------
@@ -794,6 +819,30 @@ void spu_ch_wake(spu_context* ctx);
  * SPU code is looping. Report the SPU pc/image once and halt instead.
  * SPU_HOST_DEPTH_MAX overrides the limit. */
 void spu_depth_guard(spu_context* ctx);
+/* Put this host thread's FPU in the SPU single-precision mode (spu_helpers.h,
+ * spu_fp_enter_spu_mode). Called where a host thread starts running lifted SPU code. */
+void spu_fp_thread_spu_mode(void);
+
+/* The per-step hooks of a trampoline drain (SPU_DRAIN, spu_drain_call).
+ * spu_task_launch_check and yz_lockstep_tick are cheap, but as two calls on
+ * every lifted branch they were a tenth of Warhawk's SPU worker time. What a
+ * step needs when nothing is armed is the recent-pc ring and the LS-0
+ * job-end test; anything else (an SPU_* step trace, SPU_JOBDRAIN, a
+ * registered stack-reset entry, the PM flow recorder) sets g_spu_step_full
+ * and every step takes the full check again. -1 = not decided yet. */
+extern volatile int g_yz_lockstep_on;
+extern int g_spu_step_full;
+extern void* volatile g_pm_flow_ctx;
+extern SPU_THREAD_LOCAL uint32_t g_spu_recent[32];
+extern SPU_THREAD_LOCAL uint32_t g_spu_recent_n;
+static inline void spu_step_hooks(spu_context* ctx, void* fn)
+{
+    if (g_yz_lockstep_on) yz_lockstep_tick(ctx);
+    if (g_spu_step_full || g_pm_flow_ctx) { spu_task_launch_check(ctx, fn); return; }
+    g_spu_recent[g_spu_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    if (ctx->steps++ && (ctx->pc & SPU_LS_MASK) == 0 && !ctx->policy_mode && ctx->image_id > 0)
+        spu_task_launch_check(ctx, fn);   /* LS 0: the full check ends the job */
+}
 int  spu_tailret_enabled(void);
 /* Take a pending SPU interrupt (spu_drain.c): srr0 <- ctx->pc, int_enable <- 0,
  * decode the guest-planted branch at LS 0 into ctx->pc, and return the
@@ -871,8 +920,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             }                                                              \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
-            yz_lockstep_tick(ctx);                             \
-            spu_task_launch_check((ctx), (void*)_tf);          \
+            spu_step_hooks((ctx), (void*)_tf);                 \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
                 _tf = spu_take_interrupt((ctx), _tf);          \
