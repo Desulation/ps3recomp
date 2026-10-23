@@ -506,6 +506,73 @@ static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageF
     return 0;
 }
 
+/* A batch arena (below): memory the GPU reads every operation's vertices,
+ * indices, constants and upload staging from, and the CPU only writes. On a
+ * discrete GPU the first host-visible type is system memory, so each of those
+ * reads crossed PCIe: ~35 MB a frame in a Warhawk match, which held a Radeon
+ * RX 580 on a PCIe x4 link at 22 FPS where device-local arenas reach the
+ * game's 30 FPS cap. So an arena goes in memory that is device-local and
+ * host-visible when that heap is large -- resizable BAR on a discrete GPU, all
+ * of memory on an integrated one -- and write-combining costs nothing, since
+ * nothing reads it back. A 256 MB BAR is left to the driver (the arenas would
+ * take half of it), as is any allocation that fails: those fall back to
+ * system memory. PS3RECOMP_VK_ARENA=host keeps the arenas in system memory,
+ * PS3RECOMP_VK_ARENA=device takes device-local host-visible memory whatever
+ * its size. */
+#ifndef VK_ARENA_DEVICE_MIN_HEAP             /* settable from the build, like VK_BATCH_ARENA */
+#define VK_ARENA_DEVICE_MIN_HEAP (1ull << 30)
+#endif
+
+static int vk_create_arena(vk_buffer* b, VkDeviceSize size, VkBufferUsageFlags usage)
+{
+    static int mode = -1;                   /* 0 by heap size, 1 host, 2 device */
+    static int logged;
+    if (mode < 0) {
+        const char* e = getenv("PS3RECOMP_VK_ARENA");
+        mode = (e && !strcmp(e, "host")) ? 1 : (e && !strcmp(e, "device")) ? 2 : 0;
+    }
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const char* why = "PS3RECOMP_VK_ARENA=host";
+    if (mode != 1) {
+        VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                   .size = size, .usage = usage,
+                                   .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+        VK_CHECK(pvkCreateBuffer(s_vk.device, &bci, NULL, &b->buf), "vkCreateBuffer");
+        VkMemoryRequirements req;
+        pvkGetBufferMemoryRequirements(s_vk.device, b->buf, &req);
+        u32 type;
+        why = "no device-local host-visible memory";
+        if (vk_find_memory_type(req.memoryTypeBits, want, &type) == 0) {
+            const VkDeviceSize heap = s_vk.memprops.memoryHeaps[s_vk.memprops.memoryTypes[type].heapIndex].size;
+            VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                         .allocationSize = req.size, .memoryTypeIndex = type };
+            why = "its heap is small (no resizable BAR)";
+            if (mode == 2 || heap >= VK_ARENA_DEVICE_MIN_HEAP) {
+                why = "allocating it failed";
+                if (pvkAllocateMemory(s_vk.device, &mai, NULL, &b->mem) == VK_SUCCESS) {
+                    if (pvkBindBufferMemory(s_vk.device, b->buf, b->mem, 0) == VK_SUCCESS &&
+                        pvkMapMemory(s_vk.device, b->mem, 0, VK_WHOLE_SIZE, 0, &b->ptr) == VK_SUCCESS) {
+                        b->size = size;
+                        b->coherent = 1;
+                        if (!logged++) VK_LOG("batch: arenas in device-local host-visible memory (heap %u, %llu MB)\n",
+                                              s_vk.memprops.memoryTypes[type].heapIndex,
+                                              (unsigned long long)(heap >> 20));
+                        return 0;
+                    }
+                    pvkFreeMemory(s_vk.device, b->mem, NULL);
+                    b->mem = VK_NULL_HANDLE;
+                }
+            }
+        }
+        pvkDestroyBuffer(s_vk.device, b->buf, NULL);
+        b->buf = VK_NULL_HANDLE;
+    }
+    if (!logged++) VK_LOG("batch: arenas in host memory: %s\n", why);
+    return vk_create_host_buffer(b, size, usage);
+}
+
 static void vk_destroy_buffer(vk_buffer* b)
 {
     if (b->buf) vk_batch_wait_all();
@@ -630,7 +697,8 @@ static void vk_barrier_image(VkImage img, VkImageAspectFlags aspect, VkImageLayo
  * again.
  *
  * Everything the GPU reads from host memory goes into the slot's arena --
- * vertices, indices, constants, upload staging -- so nothing is overwritten
+ * vertices, indices, constants, upload staging, in device-local memory when
+ * the CPU can write it (vk_create_arena) -- so nothing is overwritten
  * under a draw still in flight, and each draw gets a descriptor set of its
  * own from the slot's pool. Every operation starts with a full memory
  * barrier (vk_rec), so the GPU runs them in the order and with the
@@ -711,10 +779,10 @@ static int vk_batch_init(void)
         VkDescriptorPoolCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                                            .maxSets = VK_BATCH_SETS, .poolSizeCount = 3, .pPoolSizes = ps };
         VK_CHECK(pvkCreateDescriptorPool(s_vk.device, &dci, NULL, &b->dpool), "vkCreateDescriptorPool(batch)");
-        if (vk_create_host_buffer(&b->arena, VK_BATCH_ARENA,
-                                  VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT) || !b->arena.coherent) {
+        if (vk_create_arena(&b->arena, VK_BATCH_ARENA,
+                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_DST_BIT) || !b->arena.coherent) {
             VK_LOG("batch: no host-coherent memory for the arena\n");
             return -1;
         }
