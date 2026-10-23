@@ -32,6 +32,7 @@ static u32 s_gcm_context_ea = 0;
 #else
 #include <time.h>
 #endif
+#include "../../include/ps3emu/ps3_env.h"  /* getenv cached per call site */
 
 /* ---------------------------------------------------------------------------
  * Timestamp helpers (same pattern as sys_timer)
@@ -651,8 +652,22 @@ void cellGcmSetFlipMode(u32 mode)
 }
 
 /* NID: 0xC44D8F34 */
+static int s_waitflip_block = -1;   /* GCM_WAITFLIP_BLOCK, read on first use */
 void cellGcmSetWaitFlip(void)
 {
+    /* GCM_WAITFLIP_BLOCK=0: return at once. On the console this call only
+     * queues a command that makes the RSX wait for the pending flip before
+     * the commands after it; the PPU carries on. Blocking the PPU here until
+     * the host has presented and the next 16 ms tick has completed the flip
+     * held Warhawk's main thread 6-22 ms a frame, on top of its own
+     * 30 FPS limiter (22 -> 31 FPS on Island Outpost, docs/bringup.md in the
+     * Warhawk port). Titles that pace themselves through this wait keep the
+     * default, 1. */
+    if (s_waitflip_block < 0) {
+        const char* e = getenv("GCM_WAITFLIP_BLOCK");
+        s_waitflip_block = e ? (atoi(e) != 0) : 1;
+    }
+    if (!s_waitflip_block) return;
     /* Block until the pending flip completes (the present thread marks it done
      * via cellGcmTickFlip, ~once per display refresh). This throttles the title
      * to vsync; without it the guest loops unthrottled and many frames batch

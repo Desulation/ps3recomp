@@ -794,6 +794,7 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
      * instead of killing the process silently with 0x80000001. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    spu_fp_thread_spu_mode();
     spu_async_run((spu_async_job*)p);
     /* Nothing on this stack may stay in the lock-line reserver set. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);

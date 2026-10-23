@@ -25,6 +25,58 @@ float rsx_rd_half_be(const u8* p)
     float o; memcpy(&o, &f, 4); return o;
 }
 
+/* One array element at p, by its NV4097 type, into the first n components of
+ * out (the rest keep what is there). idx and stride only label the log line. */
+static inline void fetch_convert(u32 type, u32 n, int idx, u32 stride, const u8* p, float out[4])
+{
+    if (n > 4) n = 4;
+    switch (type) {
+    case 2: /* CELL_GCM_VERTEX_F: float32 BE */
+        for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);
+        break;
+    case 3: /* SF: half float BE */
+        for (u32 k = 0; k < n; k++) out[k] = rsx_rd_half_be(p + k * 2);
+        break;
+    case 4: /* UB: u8 normalized [0,1] */
+        for (u32 k = 0; k < n; k++) out[k] = p[k] / 255.0f;
+        break;
+    case 1: /* S1: s16 normalized [-1,1] */
+        for (u32 k = 0; k < n; k++) {
+            s16 s = (s16)((p[k*2] << 8) | p[k*2+1]);
+            out[k] = (float)s / 32767.0f;
+        }
+        break;
+    case 5: /* S32K: s16 integer */
+        for (u32 k = 0; k < n; k++)
+            out[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]);
+        break;
+    case 7: /* UB256: u8 unnormalized */
+        for (u32 k = 0; k < n; k++) out[k] = (float)p[k];
+        break;
+    case 6: { /* CMP: one BE word, signed normalized x:11 y:11 z:10, w = 1.
+               * Warhawk feeds attribute 2 (normals) this way; read as a float
+               * it lit the soldier and the vehicles black. */
+        u32 w = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+        s32 x = (s32)(w & 0x7FFu);         if (x & 0x400) x -= 0x800;
+        s32 y = (s32)((w >> 11) & 0x7FFu); if (y & 0x400) y -= 0x800;
+        s32 z = (s32)((w >> 22) & 0x3FFu); if (z & 0x200) z -= 0x400;
+        out[0] = (float)x / 1023.0f;
+        out[1] = (float)y / 1023.0f;
+        out[2] = (float)z / 511.0f;
+        out[3] = 1.0f;
+        break;
+    }
+    default:
+        { static int t = -1; if (t < 0) t = getenv("VTX_TYPEDBG") ? 1 : 0;
+          if (t) { static u32 seen = 0;
+              if (!(seen & (1u << (type & 31)))) { seen |= 1u << (type & 31);
+                  fprintf(stderr, "[VTXTYPE] UNHANDLED type=%u attr=%d size=%u stride=%u\n",
+                          type, idx, n, stride); } } }
+        for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);
+        break;
+    }
+}
+
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
 {
     /* A disabled attribute array feeds the CONSTANT vertex attribute register
@@ -73,37 +125,48 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
         ? cellGcmResolveLocated(0, off)   /* MAIN:  IO offset table          */
         : cellGcmResolveLocated(1, off)); /* LOCAL: VRAM, never the IO table */
 
-    u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
-    switch (a->type) {
-    case 2: /* CELL_GCM_VERTEX_F: float32 BE */
-        for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);
-        break;
-    case 3: /* SF: half float BE */
-        for (u32 k = 0; k < n; k++) out[k] = rsx_rd_half_be(p + k * 2);
-        break;
-    case 4: /* UB: u8 normalized [0,1] */
-        for (u32 k = 0; k < n; k++) out[k] = p[k] / 255.0f;
-        break;
-    case 1: /* S1: s16 normalized [-1,1] */
-        for (u32 k = 0; k < n; k++) {
-            s16 s = (s16)((p[k*2] << 8) | p[k*2+1]);
-            out[k] = (float)s / 32767.0f;
-        }
-        break;
-    case 5: /* S32K: s16 integer */
-        for (u32 k = 0; k < n; k++)
-            out[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]);
-        break;
-    case 7: /* UB256: u8 unnormalized */
-        for (u32 k = 0; k < n; k++) out[k] = (float)p[k];
-        break;
-    default:
-        { static int t = -1; if (t < 0) t = getenv("VTX_TYPEDBG") ? 1 : 0;
-          if (t) { static u32 seen = 0;
-              if (!(seen & (1u << (a->type & 31)))) { seen |= 1u << (a->type & 31);
-                  fprintf(stderr, "[VTXTYPE] UNHANDLED type=%u attr=%d size=%u stride=%u\n",
-                          a->type, idx, a->size, a->stride); } } }
-        for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);
-        break;
+    fetch_convert(a->type, a->size ? a->size : 4, idx, a->stride, p, out);
+}
+
+/* Attribute frequency rule as rsx_fetch_attrib applies it; 0 = per vertex. */
+static int fetch_nofreq(void)
+{
+    static int nofreq = -1;                 /* VP_NOFREQ: instancing kill-switch */
+    if (nofreq < 0) nofreq = getenv("VP_NOFREQ") ? 1 : 0;
+    return nofreq;
+}
+
+void rsx_fetch_plan_init(const rsx_state* st, rsx_fetch_plan* plan)
+{
+    memcpy(plan->defaults, st->vertex_data4f, sizeof plan->defaults);
+    plan->n = 0;
+    if (!vm_base) return;
+    for (int idx = 0; idx < 16; idx++) {
+        const rsx_vertex_attrib* a = &st->vertex_attribs[idx];
+        if (!a->enabled || a->stride == 0) continue;
+        rsx_fetch_plan_attr* f = &plan->a[plan->n++];
+        f->idx = (u8)idx; f->type = (u8)a->type;
+        f->n = (u8)(a->size ? (a->size > 4 ? 4 : a->size) : 4);
+        f->main = (a->offset & 0x80000000u) != 0;
+        f->stride = a->stride;
+        f->freq = (a->frequency > 1 && !fetch_nofreq()) ? a->frequency : 0;
+        f->modulo = (st->frequency_divider_op & (1u << idx)) != 0;
+        /* LOCAL resolves as localAddress + offset (cellGcmResolveLocated), so
+         * it is resolved once here and the element offset added per vertex in
+         * the same 32-bit arithmetic. MAIN goes through the IO table, whose
+         * 1 MB pages need not be contiguous, so it is resolved per vertex. */
+        f->off = f->main ? (a->offset & 0x7FFFFFFFu) : cellGcmResolveLocated(1, a->offset & 0x7FFFFFFFu);
+    }
+}
+
+void rsx_fetch_vertex(const rsx_fetch_plan* plan, u32 vi, float out[16][4])
+{
+    memcpy(out, plan->defaults, sizeof plan->defaults);
+    for (int k = 0; k < plan->n; k++) {
+        const rsx_fetch_plan_attr* f = &plan->a[k];
+        const u32 ei = f->freq ? (f->modulo ? vi % f->freq : vi / f->freq) : vi;
+        const u32 off = f->off + ei * f->stride;
+        const u8* p = vm_base + (f->main ? cellGcmResolveLocated(0, off) : off);
+        fetch_convert(f->type, f->n, f->idx, f->stride, p, out[f->idx]);
     }
 }

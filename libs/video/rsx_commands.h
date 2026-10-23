@@ -200,6 +200,15 @@ extern "C" {
 #define NV4097_SET_CULL_FACE                    0x00001830
 #define NV4097_SET_FRONT_FACE                   0x00001834
 
+/* Near/far clipping: [3:0] cull near/far enable, [7:4] z clamp,
+ * [11:8] cull ignore w. Reset value 1 (clipping on). */
+#define NV4097_SET_ZMIN_MAX_CONTROL             0x00001D78
+
+/* Primitive restart: an index equal to RESTART_INDEX ends the current
+ * strip/fan instead of being fetched as a vertex. */
+#define NV4097_SET_RESTART_INDEX_ENABLE         0x00001DAC
+#define NV4097_SET_RESTART_INDEX                0x00001DB0
+
 /* Primitive types */
 #define RSX_PRIMITIVE_POINTS             1
 #define RSX_PRIMITIVE_LINES              2
@@ -286,6 +295,7 @@ typedef struct rsx_state {
     int cull_face_enable;
     u32 cull_face;
     u32 front_face;
+    u32 zminmax_control;   /* NV4097_SET_ZMIN_MAX_CONTROL */
 
     /* Color mask — bits: [0] B, [8] G, [16] R, [24] A */
     u32 color_mask;
@@ -333,6 +343,8 @@ typedef struct rsx_state {
     u32 begin_epoch;
     u32 index_array_offset;
     u32 index_array_dma;
+    int restart_index_enable;  /* NV4097_SET_RESTART_INDEX_ENABLE */
+    u32 restart_index;         /* NV4097_SET_RESTART_INDEX */
 
     /* Shader state */
     /* RSX viewport transform (SET_VIEWPORT_OFFSET 0x0A20 / _SCALE 0x0A30,

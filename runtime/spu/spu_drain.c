@@ -6,6 +6,7 @@
  * functions (not macros) means the SPU_DRAIN/SPU_RET call sites are already in
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
+#include "spu_helpers.h"   /* spu_fp_enter_spu_mode */
 #include <setjmp.h>
 
 /* See spu_context.h `irq_frame`. */
@@ -48,18 +49,24 @@ void* volatile    g_pm_flow_ctx = 0;
 extern void spu_halt(spu_context*);
 /* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
  * ended where it should not have (spurs_policy.c, [pm-end]). */
-static _Thread_local uint32_t t_recent[32];
-static _Thread_local uint32_t t_recent_n;
+SPU_THREAD_LOCAL uint32_t g_spu_recent[32];
+SPU_THREAD_LOCAL uint32_t g_spu_recent_n;
+int g_spu_step_full = -1;   /* see spu_step_hooks */
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 {
-    unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
-    for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
+    unsigned n = g_spu_recent_n < 32 ? g_spu_recent_n : 32, k = n < max ? n : max;
+    for (unsigned i = 0; i < k; i++) out[i] = g_spu_recent[(g_spu_recent_n - k + i) & 31];
     return k;
 }
 
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    g_spu_recent[g_spu_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    /* Whether any step needs this function at all (spu_step_hooks). A
+     * stack-reset registration sets it too, so only an unset flag is decided. */
+    if (g_spu_step_full < 0)
+        g_spu_step_full = (getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
+                           getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN")) ? 1 : 0;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
@@ -333,6 +340,9 @@ void (*spu_take_interrupt(spu_context* ctx,
 }
 
 /* See the declaration in spu_context.h. */
+void spu_fp_thread_spu_mode(void) { spu_fp_enter_spu_mode(); }
+
+/* See the declaration in spu_context.h. */
 void spu_depth_guard(spu_context* ctx)
 {
     static uint32_t s_max = 0;
@@ -343,10 +353,12 @@ void spu_depth_guard(spu_context* ctx)
 
     /* Ring of recent drain sites. When the depth trips, the useful question is
      * not "where are we" but "what cycle got us here" -- one pc names a point,
-     * a ring names the loop. */
+     * a ring names the loop. Per thread: this runs on every drain call, and one
+     * ring shared by all the SPU threads kept its cache line moving between
+     * cores (and mixed their sites together). */
     enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
+    static SPU_THREAD_LOCAL uint32_t s_ring[RING];
+    static SPU_THREAD_LOCAL uint32_t s_n;
     s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
     s_n++;
 
@@ -395,6 +407,68 @@ int spu_tailret_enabled(void)
 typedef void (*spu_drain_fn)(spu_context*);
 extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
+/* SPU_CAP=<dir>,<image>,<lsa>[,<skip>[,<every>[,<count>]]]: write the SPU
+ * context and its 256 KB local store to <dir>/cap<N>.bin when this loop is
+ * about to run the lifted block at <lsa> of image <image>: on the hit after
+ * the first <skip> (default 0), then every <every> hits (default 1), <count>
+ * times (default 8). Up to twelve such specs, separated by ';', are armed at
+ * once (give each its own <dir>). The Warhawk port replays these through a
+ * lifted module to time it and to check a native version of a hot region
+ * against it bit for bit (warhawk docs/spu-native.md, tools/spu_replay.c).
+ * s_cap_on is 0 when unset, so the loop pays one predictable compare. */
+#define SPU_CAP_MAX 12
+static volatile int s_cap_on = 1;   /* 1: not read yet, 2: armed, 0: off or done */
+static struct spu_cap_spec {
+    char dir[260]; int img; uint32_t lsa; void* volatile fn;   /* fn 0 until resolved */
+    long skip, every, count; volatile long hits, done;
+} s_cap[SPU_CAP_MAX];
+static int s_cap_n;
+static __attribute__((noinline, cold)) void spu_cap_hit(spu_context* ctx, void* fn)
+{
+    if (s_cap_on == 1) {
+        static volatile long s_once;
+        if (__atomic_exchange_n(&s_once, 1, __ATOMIC_ACQ_REL)) return;   /* another thread parses */
+        const char* e = getenv("SPU_CAP");
+        int n = 0;
+        while (e && *e && n < SPU_CAP_MAX) {
+            struct spu_cap_spec* c = &s_cap[n];
+            char lsa[32] = "";
+            c->every = 1; c->count = 8;
+            if (sscanf(e, "%259[^,;],%d,%31[^,;],%ld,%ld,%ld", c->dir, &c->img, lsa,
+                       &c->skip, &c->every, &c->count) < 3) break;
+            c->lsa = (uint32_t)strtoul(lsa, 0, 16);
+            if (c->every < 1) c->every = 1;
+            n++;
+            e = strchr(e, ';'); if (e) e++;
+        }
+        s_cap_n = n;
+        s_cap_on = n ? 2 : 0;
+        return;
+    }
+    int live = 0;
+    for (int i = 0; i < s_cap_n; i++) {
+        struct spu_cap_spec* c = &s_cap[i];
+        if (c->done >= c->count) continue;
+        live = 1;
+        if (!c->fn) {
+            void* f = (void*)spu_lookup(c->lsa, c->img);
+            if (!f) continue;   /* module not registered yet */
+            c->fn = f;
+        }
+        if (fn != c->fn) continue;
+        const long h = __atomic_add_fetch(&c->hits, 1, __ATOMIC_RELAXED);
+        if (h <= c->skip || (h - c->skip - 1) % c->every) continue;
+        const long k = __atomic_fetch_add(&c->done, 1, __ATOMIC_RELAXED);
+        if (k >= c->count) continue;
+        char path[300];
+        snprintf(path, sizeof path, "%s/cap%ld.bin", c->dir, k);
+        FILE* out = fopen(path, "wb");
+        if (out) { fwrite(ctx, sizeof *ctx, 1, out); fwrite(ctx->ls, 1, 256 * 1024, out); fclose(out); }
+        fprintf(stderr, "[SPU_CAP] %s (hit %ld of image %d at 0x%05X)%c", path, h, c->img, c->lsa, 10);
+    }
+    if (!live) s_cap_on = 0;
+}
+
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
     spu_depth_guard(ctx);
@@ -416,8 +490,8 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             void (*fn)(spu_context*) = g_spu_trampoline_fn;
             g_spu_trampoline_fn = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
-            yz_lockstep_tick(ctx);
-            spu_task_launch_check(ctx, (void*)fn);
+            spu_step_hooks(ctx, (void*)fn);
+            if (__builtin_expect(s_cap_on != 0, 0)) spu_cap_hit(ctx, (void*)fn);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */

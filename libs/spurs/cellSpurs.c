@@ -15,6 +15,7 @@
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+#include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -1664,14 +1665,24 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
+    /* Policy modules and the job code they run are lifted SPU code: run them in
+     * the SPU single-precision FPU mode like every other SPU host thread
+     * (spu_raw.c, lv2 SPU threads, async jobs). Without it every float op of
+     * every job took the exact double-precision path. */
+    spu_fp_thread_spu_mode();
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)
             SleepConditionVariableSRW(&si->wake, &si->lock, INFINITE, 0);
         if (si->stopping && !slot->busy) break;
         ReleaseSRWLockExclusive(&si->lock);
+        const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
                               slot->data, slot->wid, slot->ea, slot->spu_num);
+        /* PS3_FTRACE: one busy span per policy-module run on this virtual SPU
+         * (who = 100 + SPU number), tagged with the image and workload id. */
+        if (ft_t0) ps3_ft_span(PS3_FT_SPU_BUSY, 100 + slot->spu_num, (uint32_t)slot->image_id,
+                               slot->wid, ft_t0, ps3_ft_now());
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls;
         unsigned polls = g_spurs_pm_polls;
         AcquireSRWLockExclusive(&si->lock);

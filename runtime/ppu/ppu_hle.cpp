@@ -20,6 +20,7 @@
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+#include "ps3emu/ps3_ftrace.h" /* PS3_FTRACE: blocking HLE calls as spans */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -182,6 +183,18 @@ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    /* PS3_FTRACE: an HLE call that blocks (an event flag, a SPURS wait, a
+     * lightweight mutex) is a wait the timeline otherwise cannot see, since
+     * only lv2 syscalls are recorded. A span of kind SYSCALL with a = the NID
+     * (NIDs are hashes, never small syscall numbers) and b = the guest call
+     * site. */
+    struct HleSpan {
+        ppu_context* c; uint32_t nid, lr; uint64_t t0;
+        ~HleSpan() { if (t0 && c) { const uint64_t t1 = ps3_ft_now();
+                     if (t1 - t0 >= ps3_ft_min_ns())
+                         ps3_ft_span(PS3_FT_SYSCALL, (uint32_t)c->thread_id, nid, lr, t0, t1); } }
+    } _hs{ ctx, nid, ctx ? (uint32_t)ctx->lr : 0u, (PS3_FT_ON() && ctx) ? ps3_ft_now() : 0 };
+
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --

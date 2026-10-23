@@ -41,7 +41,9 @@ extern "C" {
 #endif
 
 enum ps3_ft_kind {
-    PS3_FT_SYSCALL     = 1,  /* who = PPU tid, a = syscall number, b = guest lr        */
+    PS3_FT_SYSCALL     = 1,  /* who = PPU tid, a = syscall number, b = guest lr;       */
+                             /* an HLE library call (ps3_hle_call) is recorded the same */
+                             /* way with a = its NID, which is never a small number.    */
     PS3_FT_USLEEP      = 2,  /* who = PPU tid, a = usleep calls merged, b = guest lr   */
     PS3_FT_SPU_WAIT    = 3,  /* who = SPU id,  a = channel,      b = LS pc             */
     PS3_FT_SPU_BUSY    = 4,  /* who = SPU id,  a = lifted image, b = SPURS wid (LS 0x1DC) */

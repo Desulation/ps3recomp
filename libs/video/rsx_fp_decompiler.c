@@ -43,6 +43,11 @@
 #define FP_SRC_NEGATE       (1u << 17)
 #define FP_SRC0_ABS         (1u << 29) /* in DWORD1 */
 #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
+#define FP_SRC_PREC_SHIFT   19         /* DWORD2: src0/1/2 precision at 19/22/25, 3 bits each */
+#define   FP_PREC_REAL      0
+#define   FP_PREC_FIXED12   2
+#define   FP_PREC_FIXED9    3
+#define   FP_PREC_SATURATE  4
 #define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
 
 /* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
@@ -315,6 +320,7 @@ typedef struct {
     int negate;
     int abs;
     char swz[5];    /* e.g. "xyzw" */
+    u32 prec;       /* SRC1 precision modifier for this operand (FP_PREC_*) */
 } Src;
 
 static void decode_src(u32 w, int abs_bit, Src* s)
@@ -328,6 +334,7 @@ static void decode_src(u32 w, int abs_bit, Src* s)
     for (int i = 0; i < 4; i++)
         s->swz[i] = comp[(w >> (FP_SRC_SWZ_SHIFT + 2 * i)) & 3];
     s->swz[4] = '\0';
+    s->prec = FP_PREC_REAL;
 }
 
 /* HLSL expression for the interpolated input selected by OPDEST.INPUT_SRC.
@@ -360,7 +367,8 @@ static const char* input_expr(u32 input_src)
 
 /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
 static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int has_k,
-                     int buffered, u32 constant_slot, char* buf, u32 bufsz)
+                     int buffered, u32 constant_slot, char* buf, u32 bufsz,
+                     int* uses_pclamp)
 {
     char base[96];
     if (s->type == FP_REG_TYPE_TEMP) {
@@ -390,11 +398,39 @@ static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int
     char swz[160];
     snprintf(swz, sizeof(swz), "(%s).%s", base, s->swz);
 
-    const char* pre = "";
-    const char* post = "";
-    if (s->abs)    { pre = "abs("; post = ")"; }
-    if (s->negate) snprintf(buf, bufsz, "-(%s%s%s)", pre, swz, post);
-    else           snprintf(buf, bufsz, "%s%s%s", pre, swz, post);
+    /* Source precision modifier (SRC1 bits 19-27, three bits per operand):
+     * saturate clamps to [0, 1] before abs, fx12 / fx9 to [-2, 2] / [-1, 1]
+     * after it, and negate comes last; all three flush NaN to 0 (RPCS3
+     * FragmentProgramDecompiler GetSRC / ClampValue, precision_clamp).
+     * COL0/COL1 are saturated already and the facing flag is exact, so only
+     * WPOS, FOGC and the texcoords take it among the inputs. The fp16 range
+     * clamp (+-65504) is not applied. Cg puts a saturate on pow(N.L, k)'s
+     * LG2: Warhawk's characters and vehicles read N.L from an interpolant
+     * that is negative wherever the surface faces away from the sun, and
+     * without the clamp LG2 made NaN there, which the output's NaN guard
+     * wrote as black. */
+    u32 prec = s->prec;
+    if (s->type == FP_REG_TYPE_INPUT &&
+        !(input_src == 0x0 || input_src == 0x3 || (input_src >= 0x4 && input_src <= 0xD)))
+        prec = FP_PREC_REAL;
+    char clamped[200];
+    const char* v = swz;
+    if (prec == FP_PREC_SATURATE) {
+        snprintf(clamped, sizeof(clamped), "_rsx_pclamp(%s, 0.0, 1.0)", swz);
+        v = clamped;
+        *uses_pclamp = 1;
+    }
+    char absd[220];
+    if (s->abs) { snprintf(absd, sizeof(absd), "abs(%s)", v); v = absd; }
+    char fixed[260];
+    if (prec == FP_PREC_FIXED12 || prec == FP_PREC_FIXED9) {
+        snprintf(fixed, sizeof(fixed), "_rsx_pclamp(%s, %s)", v,
+                 prec == FP_PREC_FIXED12 ? "-2.0, 2.0" : "-1.0, 1.0");
+        v = fixed;
+        *uses_pclamp = 1;
+    }
+    if (s->negate) snprintf(buf, bufsz, "-(%s)", v);
+    else           snprintf(buf, bufsz, "%s", v);
 }
 
 /* Dest write-mask letters from OPDEST bits 9..12 (X..W). */
@@ -664,6 +700,7 @@ static int rsx_fp_decompile_internal(
     Out o = { out, out_size, 0, 1 };
     out[0] = '\0';
     int uses_pack = 0;   /* a pack or unpack opcode was decoded: the preamble gets its helpers */
+    int uses_pclamp = 0; /* a source precision modifier was decoded: _rsx_pclamp */
     out_puts(&o,
         "    float4 r[48]; float4 h[48];\n"
         /* Fully initialise both register files: RSX programs routinely read a
@@ -777,6 +814,11 @@ static int rsx_fp_decompile_internal(
         decode_src(w1, w1 & FP_SRC0_ABS, &s0);
         decode_src(w2, w2 & FP_SRC1_ABS, &s1);
         decode_src(w3, 0,                &s2);
+        if (!is_branch) {
+            s0.prec = (w2 >> (FP_SRC_PREC_SHIFT + 0)) & 7u;
+            s1.prec = (w2 >> (FP_SRC_PREC_SHIFT + 3)) & 7u;
+            s2.prec = (w2 >> (FP_SRC_PREC_SHIFT + 6)) & 7u;
+        }
 
         /* Inline constant: any CONST source pulls the next 16 bytes as a
          * float4 literal and advances past it. */
@@ -799,16 +841,16 @@ static int rsx_fp_decompile_internal(
          * (RPCS3 RSXFragmentProgram.h SRC2); on a branch the word is an
          * address instead. */
         const int persp = !is_branch && (w3 >> 31) != 0;
-        char a[200], b[200], c[200];
+        char a[280], b[280], c[280];
         emit_src(
             &s0, input_src, persp, k, has_k, buffered, constant_slot,
-            a, sizeof(a));
+            a, sizeof(a), &uses_pclamp);
         emit_src(
             &s1, input_src, persp, k, has_k, buffered, constant_slot,
-            b, sizeof(b));
+            b, sizeof(b), &uses_pclamp);
         emit_src(
             &s2, input_src, persp, k, has_k, buffered, constant_slot,
-            c, sizeof(c));
+            c, sizeof(c), &uses_pclamp);
         if (has_k)
             constant_slot++;
 
@@ -1325,6 +1367,8 @@ static int rsx_fp_decompile_internal(
         "float4 _rsx_up2h(float v) { uint u = asuint(v); return float4(f16tof32(u & 65535u), f16tof32(u >> 16), f16tof32(u & 65535u), f16tof32(u >> 16)); }\n"
         "float4 _rsx_lin2srgb(float4 cl) { cl = saturate(cl); float4 low = cl * 12.92; float4 high = 1.055 * pow(cl, 1.0 / 2.4) - 0.055; return saturate((cl < 0.0031308) ? low : high); }\n"
         "float4 _rsx_srgb2lin(float4 cs) { float4 a = cs / 12.92; float4 b = pow(max(cs + 0.055, 0.0) / 1.055, 2.4); return (cs > 0.04045) ? b : a; }\n");
+    if (uses_pclamp) out_puts(&p,
+        "float4 _rsx_pclamp(float4 x, float lo, float hi) { return clamp(isnan(x) ? (float4)0.0 : x, lo, hi); }\n");
     if (targets == 1 && !depth_export) {
         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
     } else {
