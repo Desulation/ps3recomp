@@ -17,7 +17,8 @@
  *   draw engine backend    rsx_draw_backend: targets, clears, present and
  *                          readback (E1), pipelines and draws (E2), textures,
  *                          surface views and samplers (E3), depth snapshots
- *                          (E4) -- the stage names in the commit history
+ *                          (E4) and depth read as A8R8G8B8 (E4b) -- the stage
+ *                          names in the commit history
  *   public entry points    init picks the path, shutdown undoes everything
  *
  * The vtable path is deliberately synchronous: every clear, draw and present
@@ -29,13 +30,16 @@
  * Images stay in VK_IMAGE_LAYOUT_GENERAL for their whole life: legal for
  * transfers, sampling and as attachments, so there is no layout bookkeeping.
  *
- * Shaders: libs/video/vulkan/rsx_vk_fallback.{vert,frag}, embedded as SPIR-V.
- * Regenerate after editing them with:
+ * Shaders: libs/video/vulkan/rsx_vk_fallback.{vert,frag} and
+ * rsx_vk_depth_argb.comp, embedded as SPIR-V. Regenerate after editing them
+ * with:
  *   glslangValidator -V --target-env vulkan1.0 --vn rsx_vk_fallback_vert_spv \
  *       -o rsx_vk_fallback_vert.spv.h rsx_vk_fallback.vert
  *   glslangValidator -V --target-env vulkan1.0 --vn rsx_vk_fallback_frag_spv \
  *       -o rsx_vk_fallback_frag.spv.h rsx_vk_fallback.frag
- * then `expand -t 4` both outputs: glslang indents with tabs, the project
+ *   glslangValidator -V --target-env vulkan1.0 --vn rsx_vk_depth_argb_comp_spv \
+ *       -o rsx_vk_depth_argb_comp.spv.h rsx_vk_depth_argb.comp
+ * then `expand -t 4` the outputs: glslang indents with tabs, the project
  * with spaces.
  */
 
@@ -53,6 +57,7 @@
 #include "rsx_draw_engine.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
+#include "vulkan/rsx_vk_depth_argb_comp.spv.h"
 
 /* SDL2 is already required off Windows (cellPad, cellAudio); here it only
  * opens the optional window. Same include style as those two. */
@@ -102,7 +107,8 @@
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
     X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
-    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
+    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) \
+    X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkFreeDescriptorSets)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
@@ -407,12 +413,15 @@ static int vk_find_memory_type(u32 type_bits, VkMemoryPropertyFlags want, u32* o
     return -1;
 }
 
-static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 levels,
-                                  VkImageUsageFlags usage, VkImageAspectFlags aspect)
+/* `flags` is VkImageCreateInfo's: MUTABLE_FORMAT for an image that also gets a
+ * view in another format of its class (vk_eng_depth_as_argb). */
+static int vk_create_image_ex(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 levels,
+                              VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                              VkImageCreateFlags flags)
 {
     if (!levels) levels = 1;
     VkImageCreateInfo ici = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = VK_IMAGE_TYPE_2D,
         .format = fmt, .extent = { w, h, 1 }, .mipLevels = levels, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -437,6 +446,12 @@ static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 
     };
     VK_CHECK(pvkCreateImageView(s_vk.device, &vci, NULL, &im->view), "vkCreateImageView");
     return 0;
+}
+
+static int vk_create_image_levels(vk_image* im, VkFormat fmt, u32 w, u32 h, u32 levels,
+                                  VkImageUsageFlags usage, VkImageAspectFlags aspect)
+{
+    return vk_create_image_ex(im, fmt, w, h, levels, usage, aspect, 0);
 }
 
 static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
@@ -2266,6 +2281,11 @@ typedef struct vk_eng_obj {
     u32      surface, remap, rsx_fmt;/* VIEW: what it is a view of          */
     u8       cube;                   /* TEXTURE: six layers, a CUBE view    */
     u8       snapshot;               /* COLOR: a feedback copy, never a target */
+    u32      argb;                   /* DEPTH: its A8R8G8B8 image, or 0     */
+    u32      argb_src;               /* COLOR: the depth snapshot it is converted
+                                      * from (vk_eng_depth_as_argb), never a target */
+    VkImageView     uview_src, uview_dst;   /* COLOR argb: R32_UINT views    */
+    VkDescriptorSet argb_set;
 } vk_eng_obj;
 
 static vk_eng_obj s_eobj[VK_ENG_MAX_OBJ];
@@ -2427,6 +2447,9 @@ static int vk_eng_init(void* user, u32 width, u32 height)
 
 static void vk_eng_snapshot_recycle(vk_eng_obj* o);
 
+static void vk_dargb_release(vk_eng_obj* o);
+static void vk_dargb_shutdown(void);
+
 static void vk_eng_release(void* user, u32 handle)
 {
     (void)user;
@@ -2437,6 +2460,17 @@ static void vk_eng_release(void* user, u32 handle)
                 vk_destroy_image(&s_eobj[i].im);
                 memset(&s_eobj[i], 0, sizeof s_eobj[i]);
             }
+    if (s_eobj[handle].kind == VK_ENG_DEPTH && s_eobj[handle].argb) {
+        const u32 a = s_eobj[handle].argb;
+        s_eobj[handle].argb = 0;
+        if (vk_eng_get(a, VK_ENG_COLOR)) vk_eng_release(user, a);
+    }
+    if (s_eobj[handle].kind == VK_ENG_COLOR && s_eobj[handle].argb_src) {
+        /* Never an attachment, so no framebuffer names it. */
+        vk_dargb_release(&s_eobj[handle]);
+        memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
+        return;
+    }
     if (s_eobj[handle].kind == VK_ENG_DEPTH && s_eobj[handle].surface) {
         const u32 snap = s_eobj[handle].surface;
         s_eobj[handle].surface = 0;
@@ -2462,6 +2496,7 @@ static void vk_eng_shutdown(void* user)
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
     vk_eng_snapshot_pool_drain();
+    vk_dargb_shutdown();
 }
 
 static void vk_eng_submit_and_wait(void* user, u32 reason)
@@ -2859,14 +2894,19 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     u32 snap = z->surface;
     vk_eng_obj* t = vk_eng_get(snap, VK_ENG_TEXTURE);
     if (!t || t->w != w || t->h != h) {
+        if (z->argb) { const u32 a = z->argb; z->argb = 0; vk_eng_release(user, a); }
         if (t) vk_eng_release(user, snap);
+        z = vk_eng_get(depth, VK_ENG_DEPTH);
         z->surface = 0;
         snap = vk_eng_alloc();
         if (!snap) return 0;
         t = &s_eobj[snap];
-        if (vk_create_image(&t->im, VK_FORMAT_R32_SFLOAT, w, h,
-                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                            VK_IMAGE_ASPECT_COLOR_BIT)) {
+        /* Storage and mutable for vk_eng_depth_as_argb, which reads it as
+         * R32_UINT. */
+        if (vk_create_image_ex(&t->im, VK_FORMAT_R32_SFLOAT, w, h, 1,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                               VK_IMAGE_USAGE_STORAGE_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) {
             vk_destroy_image(&t->im); memset(t, 0, sizeof *t); return 0;
         }
         t->kind = VK_ENG_TEXTURE; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = w; t->h = h;
@@ -2915,6 +2955,166 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     if (own.buf) vk_destroy_buffer(&own);
     return snap;
 }
+/* ---- E4b: a depth target read as A8R8G8B8 ---------------------------------
+ * A deferred renderer reads its D24S8 depth buffer as A8R8G8B8 to rebuild
+ * positions: Warhawk does, about twice a frame, at 2560x1440. Through guest
+ * memory each read is a wait for the GPU, a 14.7 MB readback, a conversion
+ * and a decode on the CPU and a 14.7 MB upload, which held a match at
+ * ~10 FPS with the GPU two-thirds idle. Here the depth snapshot (E4) goes
+ * through one compute dispatch (vulkan/rsx_vk_depth_argb.comp) into an
+ * R8G8B8A8 image holding the texels that route would have decoded, and the
+ * engine samples it through a crossbar view like a colour target.
+ *
+ * Each depth target keeps ONE such image (its handle in `argb`), refilled on
+ * every request and released with the target or its snapshot. It is a COLOR
+ * object marked `argb_src`, never an attachment, with its own descriptor set
+ * naming R32_UINT views of the snapshot and of itself. */
+#define VK_DARGB_SETS 32
+
+static struct {
+    VkDescriptorSetLayout set_layout;
+    VkPipelineLayout      layout;
+    VkPipeline            pipe;
+    VkDescriptorPool      pool;
+    int                   failed;
+} s_dargb;
+
+static int vk_dargb_init(void)
+{
+    if (s_dargb.pipe) return 0;
+    if (s_dargb.failed) return -1;
+    s_dargb.failed = 1;                     /* until this returns 0 */
+
+    /* The engine's batches go to the graphics queue; Vulkan only promises
+     * compute on some graphics family, not on every one. */
+    u32 n = 0;
+    pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys, &n, NULL);
+    VkQueueFamilyProperties props[64];
+    if (n > 64) n = 64;
+    pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys, &n, props);
+    if (s_vk.queue_family >= n || !(props[s_vk.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+        VK_LOG("engine: depth as A8R8G8B8 needs compute on the graphics queue; using guest memory\n");
+        return -1;
+    }
+
+    const VkDescriptorSetLayoutBinding b[2] = {
+        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+    };
+    VkDescriptorSetLayoutCreateInfo lci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                            .bindingCount = 2, .pBindings = b };
+    if (pvkCreateDescriptorSetLayout(s_vk.device, &lci, NULL, &s_dargb.set_layout) != VK_SUCCESS) return -1;
+    const VkPushConstantRange pr = { VK_SHADER_STAGE_COMPUTE_BIT, 0, 3 * sizeof(u32) };
+    VkPipelineLayoutCreateInfo pli = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                       .setLayoutCount = 1, .pSetLayouts = &s_dargb.set_layout,
+                                       .pushConstantRangeCount = 1, .pPushConstantRanges = &pr };
+    if (pvkCreatePipelineLayout(s_vk.device, &pli, NULL, &s_dargb.layout) != VK_SUCCESS) return -1;
+    VkShaderModule m;
+    VkShaderModuleCreateInfo mci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                     .codeSize = sizeof rsx_vk_depth_argb_comp_spv,
+                                     .pCode = rsx_vk_depth_argb_comp_spv };
+    if (pvkCreateShaderModule(s_vk.device, &mci, NULL, &m) != VK_SUCCESS) return -1;
+    VkComputePipelineCreateInfo cpi = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main" },
+        .layout = s_dargb.layout,
+    };
+    const VkResult r = pvkCreateComputePipelines(s_vk.device, VK_NULL_HANDLE, 1, &cpi, NULL, &s_dargb.pipe);
+    pvkDestroyShaderModule(s_vk.device, m, NULL);
+    if (r != VK_SUCCESS) { s_dargb.pipe = VK_NULL_HANDLE; return -1; }
+    const VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2u * VK_DARGB_SETS };
+    VkDescriptorPoolCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                       .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+                                       .maxSets = VK_DARGB_SETS, .poolSizeCount = 1, .pPoolSizes = &ps };
+    if (pvkCreateDescriptorPool(s_vk.device, &dci, NULL, &s_dargb.pool) != VK_SUCCESS) return -1;
+    s_dargb.failed = 0;
+    return 0;
+}
+
+static void vk_dargb_release(vk_eng_obj* o)
+{
+    vk_batch_wait_all();                    /* a batch may still convert into it, or sample it */
+    if (o->argb_set) pvkFreeDescriptorSets(s_vk.device, s_dargb.pool, 1, &o->argb_set);
+    if (o->uview_src) pvkDestroyImageView(s_vk.device, o->uview_src, NULL);
+    if (o->uview_dst) pvkDestroyImageView(s_vk.device, o->uview_dst, NULL);
+    vk_destroy_image(&o->im);
+}
+
+static void vk_dargb_shutdown(void)
+{
+    if (s_dargb.pipe)       pvkDestroyPipeline(s_vk.device, s_dargb.pipe, NULL);
+    if (s_dargb.pool)       pvkDestroyDescriptorPool(s_vk.device, s_dargb.pool, NULL);
+    if (s_dargb.layout)     pvkDestroyPipelineLayout(s_vk.device, s_dargb.layout, NULL);
+    if (s_dargb.set_layout) pvkDestroyDescriptorSetLayout(s_vk.device, s_dargb.set_layout, NULL);
+    memset(&s_dargb, 0, sizeof s_dargb);
+}
+
+/* The depth target's snapshot converted into its A8R8G8B8 image, recorded in
+ * command order like the snapshot itself; 0 when it cannot be, and the
+ * engine then goes through guest memory as before. */
+static u32 vk_eng_depth_as_argb(void* user, u32 depth, u32 w, u32 h, int argb_as_rgba)
+{
+    if (vk_dargb_init()) return 0;
+    const u32 snap = vk_eng_depth_snapshot(user, depth, w, h);
+    vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
+    const vk_eng_obj* t = vk_eng_get(snap, VK_ENG_TEXTURE);
+    if (!snap || !z || !t) return 0;
+
+    u32 hd = z->argb;
+    vk_eng_obj* o = vk_eng_get(hd, VK_ENG_COLOR);
+    int fresh = 0;
+    if (!o) {
+        z->argb = 0;
+        hd = vk_eng_alloc();
+        if (!hd) return 0;
+        o = &s_eobj[hd];
+        o->kind = VK_ENG_COLOR; o->argb_src = snap;      /* vk_eng_release can undo it from here */
+        o->fmt = VK_FORMAT_R8G8B8A8_UNORM; o->bpp = 4; o->w = t->w; o->h = t->h;
+        const VkComponentMapping id = {0};
+        VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                            .descriptorPool = s_dargb.pool, .descriptorSetCount = 1,
+                                            .pSetLayouts = &s_dargb.set_layout };
+        if (vk_create_image_ex(&o->im, VK_FORMAT_R8G8B8A8_UNORM, t->w, t->h, 1,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ||
+            vk_eng_make_view(t->im.img, VK_FORMAT_R32_UINT, 1, id, 0, &o->uview_src) ||
+            vk_eng_make_view(o->im.img, VK_FORMAT_R32_UINT, 1, id, 0, &o->uview_dst) ||
+            pvkAllocateDescriptorSets(s_vk.device, &dai, &o->argb_set) != VK_SUCCESS) {
+            VK_LOG("engine: depth as A8R8G8B8: image or descriptor set failed\n");
+            vk_eng_release(user, hd);
+            return 0;
+        }
+        const VkDescriptorImageInfo ii[2] = {
+            { VK_NULL_HANDLE, o->uview_src, VK_IMAGE_LAYOUT_GENERAL },
+            { VK_NULL_HANDLE, o->uview_dst, VK_IMAGE_LAYOUT_GENERAL },
+        };
+        VkWriteDescriptorSet wr = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                    .dstSet = o->argb_set, .dstBinding = 0, .descriptorCount = 2,
+                                    .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = ii };
+        pvkUpdateDescriptorSets(s_vk.device, 1, &wr, 0, NULL);
+        z->argb = hd;
+        fresh = 1;
+    }
+
+    vk_batch* b = vk_rec(0, 0);
+    if (!b) return 0;
+    vk_barrier_image_on(b->cmd, t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_barrier_image_on(b->cmd, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT,
+                        fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL);
+    const u32 pc[3] = { o->w, o->h, argb_as_rgba ? 1u : 0u };
+    pvkCmdBindPipeline(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_dargb.pipe);
+    pvkCmdBindDescriptorSets(b->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_dargb.layout,
+                             0, 1, &o->argb_set, 0, NULL);
+    pvkCmdPushConstants(b->cmd, s_dargb.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    pvkCmdDispatch(b->cmd, (o->w + 7u) / 8u, (o->h + 7u) / 8u, 1);
+    /* The writes, visible to the draw that samples them. */
+    vk_barrier_image_on(b->cmd, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_rec_done();
+    return hd;
+}
+
 /* The depth aspect of a D32_SFLOAT target copies out as 32-bit floats, which
  * is what the engine asks for; other depth formats report failure. */
 static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
@@ -3719,6 +3919,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .depth_target_create  = vk_eng_depth_target_create,
     .depth_target_release = vk_eng_release,
     .depth_snapshot       = vk_eng_depth_snapshot,
+    .depth_as_argb        = vk_eng_depth_as_argb,
     .color_snapshot       = vk_eng_color_snapshot,
     .pipeline_create      = vk_eng_pipeline_create,
     .pipeline_release     = vk_eng_pipeline_release,

@@ -113,6 +113,8 @@ typedef struct {
     int guest_dirty;       /* written since guest memory last got a copy     */
     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
     u32 used_w, used_h;    /* the clip that write went through              */
+    u32 argb;              /* backend's A8R8G8B8 resolve (depth_as_argb), or 0 */
+    u64 argb_serial;       /* the depth_serial it was resolved at            */
 } eng_zdepth;
 
 typedef struct {
@@ -870,6 +872,8 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->had_write = 0;
     z->snapshot_valid = 0;
     z->depth_serial = 0;
+    z->argb = 0;
+    z->argb_serial = 0;
     z->guest_dirty = 0;
     if (slot == g.n_zdepths) g.n_zdepths++;
     return slot;
@@ -1291,6 +1295,77 @@ static int eng_zdepth_to_guest(u32 slot)
         fprintf(stderr, "[rsx engine] depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
                 z->offset, bpp == 2u ? "Z16" : "Z24S8", z->pitch, w, h);
     return 1;
+}
+
+/* RSX_ENGINE_DEPTH_ARGB_VERIFY=<n>: for one resolve in n, also take the
+ * guest-memory route (store, then decode as the texture names it) and
+ * compare its texels with the backend's, read back. A debugging aid: each
+ * check waits for the GPU and costs what the resolve saves. */
+static void eng_zdepth_argb_verify(u32 slot, const rsx_dsp_texture* t, u32 w, u32 h)
+{
+    static int every = -1;
+    static unsigned seen;
+    if (every < 0) { const char* e = getenv("RSX_ENGINE_DEPTH_ARGB_VERIFY"); every = e ? atoi(e) : 0; }
+    if (every <= 0 || !g.be->readback || seen++ % (unsigned)every) return;
+    eng_zdepth* z = &g.zdepths[slot];
+    z->guest_dirty = 1;                     /* store it even if guest memory had it */
+    rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
+    const size_t n = (size_t)w * h;
+    u8* cpu = (u8*)malloc(n * 4u);
+    u8* gpu = (u8*)malloc(n * 4u);
+    const u8* src = NULL;
+    if (cpu && gpu && eng_zdepth_to_guest(slot) &&
+        rsx_texture_mip_chain(t->format, w, h, 1, t->pitch, lv) && lv[0].tl.dst_row_bytes == w * 4u &&
+        (src = (const u8*)eng_guest_ptr(NULL, t->location, t->offset, lv[0].tl.face_bytes))) {
+        rsx_texture_decode(cpu, w * 4u, src, w, h, &lv[0].tl, rsx_texture_argb_is_rgba());
+        g.be->readback(g.be->user, z->argb, 0, 0, w, h, gpu, w * 4u);
+        u32 bad = 0, first = ENG_INVALID, inner = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (memcmp(cpu + i * 4u, gpu + i * 4u, 4)) { if (!bad++) first = (u32)i; }
+            if (s_depth_rows[i] > 0.0f && s_depth_rows[i] < 1.0f) inner++;
+        }
+        fprintf(stderr, "[rsx engine] depth as A8R8G8B8 verify 0x%08X %ux%u: %u of %zu texels differ"
+                        " (%u with depth strictly inside 0..1)\n", t->offset, w, h, bad, n, inner);
+        if (bad) {
+            u32 bits;
+            memcpy(&bits, &s_depth_rows[first], 4);
+            fprintf(stderr, "[rsx engine]   first at %u,%u: depth %.9g bits 0x%08X, cpu %02X%02X%02X%02X gpu %02X%02X%02X%02X\n",
+                    first % w, first / w, s_depth_rows[first], bits,
+                    cpu[first * 4u], cpu[first * 4u + 1], cpu[first * 4u + 2], cpu[first * 4u + 3],
+                    gpu[first * 4u], gpu[first * 4u + 1], gpu[first * 4u + 2], gpu[first * 4u + 3]);
+        }
+    } else {
+        fprintf(stderr, "[rsx engine] depth as A8R8G8B8 verify 0x%08X: could not take the guest route\n",
+                t->offset);
+    }
+    free(cpu);
+    free(gpu);
+}
+
+/* A Z24S8 depth target sampled as linear A8R8G8B8 (a deferred renderer
+ * rebuilding positions from its depth buffer), resolved on the GPU by the
+ * backend instead of stored into guest memory and decoded back: the texture
+ * handle to bind, or 0 to take the guest-memory route. That route stays for
+ * anything the resolve does not reproduce texel for texel -- a texture that
+ * is not exactly the stored rectangle at the zeta's pitch, a swizzled or
+ * mipmapped one, Z16 -- and guest memory is left as it was, still marked
+ * dirty, for whatever reads it that way later. */
+static u32 eng_zdepth_argb(u32 slot, const rsx_dsp_texture* t)
+{
+    eng_zdepth* z = &g.zdepths[slot];
+    if (!g.be->depth_as_argb || !g.be->surface_view || !z->handle || z->zfmt == 1u) return 0;
+    const u32 w = z->used_w < z->w ? z->used_w : z->w;
+    const u32 h = z->used_h < z->h ? z->used_h : z->h;
+    if (!w || !h || z->pitch < w * 4u || !(t->format & RSX_TEX_FMT_LINEAR) || t->cubemap ||
+        t->dimension == 3 || t->mipmaps > 1 || t->width != w || t->height != h || t->pitch != z->pitch)
+        return 0;
+    if (!z->argb || z->argb_serial != z->depth_serial) {
+        z->argb = g.be->depth_as_argb(g.be->user, z->handle, w, h, rsx_texture_argb_is_rgba());
+        z->argb_serial = z->depth_serial;
+        if (!z->argb) return 0;
+        eng_zdepth_argb_verify(slot, t, w, h);
+    }
+    return g.be->surface_view(g.be->user, z->argb, t->remap & 0xFFFFu, t->format);
 }
 
 /* A depth write or clear through the current zeta, recorded with what the
@@ -2106,6 +2181,10 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             if (base_fmt == RSX_TEX_FMT_DEPTH24_D8 && current_zslot != (u32)zsrc) {
                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                 if (snap) { textures[u] = snap; continue; }
+            }
+            if (base_fmt == RSX_TEX_FMT_A8R8G8B8 && current_zslot != (u32)zsrc) {
+                const u32 argb = eng_zdepth_argb((u32)zsrc, &t);
+                if (argb) { textures[u] = argb; continue; }
             }
             if (eng_zdepth_to_guest((u32)zsrc)) {
                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,

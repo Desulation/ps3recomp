@@ -1,0 +1,44 @@
+#version 450
+// ps3recomp Vulkan backend: a depth target read as A8R8G8B8, on the GPU.
+// The bytes are the ones the draw engine's eng_zdepth_to_guest stores for a
+// Z24S8 zeta (a big-endian word, depth in the top 24 bits, stencil 0), as
+// rsx_texture_decode then hands an A8R8G8B8 texture to the host. Both images
+// are R32_UINT views: the snapshot's floats are read as bits and the
+// R8G8B8A8 result written as one word, so nothing here rounds but depth24().
+// Regenerate rsx_vk_depth_argb_comp.spv.h as rsx_vulkan_backend.c says.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, r32ui) uniform readonly  uimage2D u_depth;  // R32_SFLOAT snapshot
+layout(set = 0, binding = 1, r32ui) uniform writeonly uimage2D u_argb;   // R8G8B8A8_UNORM
+layout(push_constant) uniform PC { uvec2 size; uint argb_as_rgba; } pc;
+
+// The CPU path's clamp, then (u32)((double)d * 16777215.0 + 0.5). That double
+// expression is exact: d * 16777215 needs at most 48 significant bits, and
+// adding 0.5 to it never needs more than 53. So it is floor(d * 16777215 + 0.5)
+// for d = m * 2^(e - 150), done here in 64-bit integers.
+uint depth24(uint bits)
+{
+    const uint e = (bits >> 23) & 0xFFu;
+    if ((bits & 0x80000000u) != 0u || e == 0u) return 0u;   // <= 0, and denormals (round to 0)
+    if (e == 0xFFu) return (bits & 0x7FFFFFu) != 0u ? 0u : 0xFFFFFFu;   // NaN -> 0, +inf -> 1
+    if (bits >= 0x3F800000u) return 0xFFFFFFu;              // >= 1
+    const uint s = 150u - e;                                // >= 24
+    if (s > 48u) return 0u;                                 // d * 16777215 < 0.5
+    uint hi, lo, carry;
+    umulExtended((bits & 0x7FFFFFu) | 0x800000u, 0xFFFFFFu, hi, lo);
+    if (s - 1u < 32u) { lo = uaddCarry(lo, 1u << (s - 1u), carry); hi += carry; }
+    else hi += 1u << (s - 33u);
+    return s < 32u ? (lo >> s) | (hi << (32u - s)) : hi >> (s - 32u);
+}
+
+void main()
+{
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(p, pc.size))) return;
+    const uint v = depth24(imageLoad(u_depth, ivec2(p)).r);
+    // Guest bytes A,R,G,B = v >> 16, v >> 8, v, 0; decoded to host R,G,B,A,
+    // or kept in guest order under TEX_RGBA (rsx_texture_argb_is_rgba).
+    const uint a = (v >> 16) & 0xFFu, r = (v >> 8) & 0xFFu, g = v & 0xFFu;
+    const uint word = pc.argb_as_rgba != 0u ? (a | (r << 8) | (g << 16))
+                                            : (r | (g << 8) | (a << 24));
+    imageStore(u_argb, ivec2(p), uvec4(word, 0u, 0u, 0u));
+}

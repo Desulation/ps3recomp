@@ -244,6 +244,17 @@ typedef struct rsx_draw_backend {
                               u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
     void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
                               u32 w, u32 h, const void* src, u32 row_bytes);
+
+    /* Optional. A depth target read as A8R8G8B8, resolved on the GPU: a
+     * colour handle (for surface_view) whose R,G,B,A texels are what storing
+     * the target into guest memory as Z24S8 -- depth in the top 24 bits of a
+     * big-endian word, stencil 0 -- and decoding those bytes as a linear
+     * A8R8G8B8 texture would give, in guest byte order when `argb_as_rgba`
+     * (rsx_texture_argb_is_rgba). Recorded in command order like
+     * depth_snapshot. The backend owns it: one per depth target, refilled on
+     * every request. 0 when it cannot, and the engine goes through guest
+     * memory. NULL keeps that route. */
+    u32  (*depth_as_argb)(void* user, u32 depth, u32 w, u32 h, int argb_as_rgba);
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
